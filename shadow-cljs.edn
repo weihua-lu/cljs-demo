@@ -1,0 +1,10 @@
+;; shadow-cljs configuration
+{:deps     {:aliases [:dev]}
+ :dev-http {8000 "classpath:public"}
+ :builds   {:main {:target     :browser
+                   :output-dir "resources/public/js/main"
+                   :asset-path "/js/main"
+                   :modules    {:main {:init-fn app.client/run
+                                       :entries [app.client]}}
+                   :devtools   {:after-load app.client/run
+                                :preloads   [devtools.preload]}}}}
