@@ -2,6 +2,7 @@
  :deps  {cljs-http/cljs-http {:mvn/version "0.1.46"}
          reagent/reagent     {:mvn/version "1.0.0"}}
 
+ ;; clj -M:dev watch main
  :aliases {:dev {:extra-paths ["src/dev"]
                  :extra-deps  {org.clojure/clojurescript {:mvn/version "1.10.773"}
                                thheller/shadow-cljs      {:mvn/version "2.11.13"}
