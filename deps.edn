@@ -1,6 +1,7 @@
 {:paths ["src/main" "resources"]
- :deps  {cljs-http/cljs-http {:mvn/version "0.1.46"}
-         reagent/reagent     {:mvn/version "1.0.0"}}
+ :deps  {cljs-http/cljs-http   {:mvn/version "0.1.46"}
+         reagent/reagent       {:mvn/version "1.0.0"}
+         datascript/datascript {:mvn/version "1.0.3"}}
 
  ;; clj -M:dev watch main
  :aliases {:dev {:extra-paths ["src/dev"]
