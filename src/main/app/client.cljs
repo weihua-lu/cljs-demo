@@ -2,10 +2,10 @@
   (:require-macros [cljs.core.async.macros :refer [go]])
   (:require [reagent.core :as r]
             [reagent.dom :as rd]
-            [clojure.string :as str :refer [includes?]]
+            [clojure.string :as str]
             [datascript.core :as d]
             [cljs-http.client :as http]
-            [cljs.core.async :refer [<!]]))
+            [cljs.core.async :refer [<! timeout]]))
 
 (def api-endpoint "https://en.wikipedia.org/w/api.php?format=json&origin=*&action=query&prop=linkshere|links")
 
@@ -25,51 +25,100 @@
 
 (defn handle-success [title response status]
   (let [[links linkshere] (map #(extract % response) [:links :linkshere])]
-    (reset! status {:searching false})
-    (d/transact! conn [{:wiki/title     title
-                        :wiki/link      links
-                        :wiki/linkshere linkshere}])))
+    (swap! status assoc :searching false)
+    (if (and (empty? linkshere) (empty? links))
+      (swap! status assoc
+             :error :error/empty-response)
+      (d/transact! conn [{:wiki/title     title
+                          :wiki/link      links
+                          :wiki/linkshere linkshere}]))))
 
 (defn handle-failure [response status]
-  (reset! status {:error (:status response)})
+  (swap! status assoc
+         :searching false
+         :error :error/bad-request)
   (prn response))
 
-(defn search [title status]
-  (go (let [_        (reset! status {:searching true})
+(defn search [status]
+  (go (let [title    (str (:search-val @status))
+            _        (swap! status assoc :searching true :error nil)
             response (<! (http/get api-endpoint
                                    {:with-credentials? false
-                                    :query-params      {:titles (str title)}}))]
+                                    :query-params      {:titles title}}))]
         (if (== 200 (:status response))
           (handle-success title response status)
           (handle-failure response status)))))
 
-(defn atom-input [value status]
-  [:input {:type "text"
-           :value @value
-           :on-change #(reset! value (-> % .-target .-value))
-           :on-key-down #(case (.-which %) 13 (search @value status) nil)}])
+(defn atom-input [status]
+  [:div.control
+   [:input.input {:type        "text"
+                  :value       (:search-val @status)
+                  :on-change   #(swap! status assoc :search-val (-> % .-target .-value))
+                  :on-focus    #(swap! status assoc :focus true)
 
-(defn title-lists [result]
-  (let [pages  (-> @result :body :query :pages)
-        titles [:a :b :c]]
-    [:ul
-     (for [title titles]
-       ^{:key title} [:li title])]))
+                  :on-blur
+                  (fn [_]
+                    (go (<! (timeout 200))
+                        (swap! status assoc :focus false)))
+
+                  :on-key-down #(case (.-which %)
+                                  13 (search status) nil)}]])
+
+(defn lower-includes? [s substr]
+  (let [s-low (str/lower-case s)
+        substr-low (str/lower-case substr)]
+    (str/includes? s-low substr-low)))
+
+(defn search-hint [input]
+  ;; hint all possibles from link or linkshere, exclude already searched title
+  (when-not (empty? input)
+    (d/q '[:find ?term
+           :in $ ?include-fn ?input
+           :where
+           (or [_ :wiki/linkshere ?term]
+               [_ :wiki/link ?term])
+           [(?include-fn ?term ?input)]
+
+           (not-join [?term]
+                     [_ :wiki/title ?term])] @conn lower-includes? input)))
+
+(defn dropdown [status]
+  (let [possible-terms (search-hint (:search-val @status))]
+    [:div.dropdown
+     {:class (if (and (not-empty possible-terms) (:focus @status)) "is-active")}
+     [atom-input status]
+     [:div.dropdown-menu
+      [:div.dropdown-content
+       (for [[hint] possible-terms]
+         ^{:key hint}
+         [:a.dropdown-item
+          {:on-click (fn [_]
+                       (go
+                         (prn "click hint")
+                         (swap! status assoc :search-val hint)
+                         (<! (search status))
+                         (swap! status assoc :search-val "")))}
+          hint])]]]))
 
 (defn result-table []
   (let [all-data (d/q '[:find (pull ?e [*])
                         :where [?e :wiki/title ]] @conn)]
-    [:table
-     [:tr
-      (for [col (->> schema keys (map str))] [:td col])]
-     (for [[{:wiki/keys [title link linkshere]}] all-data]
-       [:tr [:td (str title)] [:td (str link)] [:td (str linkshere)]])]))
+    [:div.table-container
+     [:table.table.is-striped.is-fullwidth
+      [:thead
+       [:tr
+        (for [col (->> schema keys (map str))]
+          ^{:key col} [:th col])]]
+      [:tbody
+       (for [[{:wiki/keys [title link linkshere]}] all-data]
+         ^{:key title}
+         [:tr [:td title] [:td (str link)] [:td (str linkshere)]])]]]))
 
 (defn build-relation-map [[title-a title-b relation :as v]]
-  (assoc {} (hash (str title-a title-b))
-         {:source title-a
-          :target title-b
-          :relations [relation]}))
+  {(hash (str title-a title-b))
+   {:source title-a
+    :target title-b
+    :relations [relation]}})
 
 (defn concat-relations [m1 m2]
   (let [r1 (:relations m1)
@@ -84,78 +133,113 @@
 
 (defn query-relations []
   (let [query  '[:find ?title1 ?title2 ?relation
-                 :in $ ?type
+                 :in $ ?include-fn ?type
                  :where
                  [?e1 :wiki/title ?title1]
                  [?e2 :wiki/title ?title2]
                  [?e2 ?type  ?relation]
                  [(not= ?title1 ?title2)]
-
-                 ;; case insensitive regex match
-                 [(str "(?i)" ?title1) ?patternstr]
-                 [(re-pattern ?patternstr) ?pattern]
-                 [(re-find ?pattern ?relation)]]]
+                 [(?include-fn ?relation ?title1)]]]
 
     ;; Query all relations with one title,
     ;; by fuzzy search from all other titles' linkshere(outbound link) and link(inbound link)
     (->> [:wiki/linkshere :wiki/link]
-         (mapcat #(d/q query @conn %)))))
+         (mapcat #(d/q query @conn lower-includes? %)))))
 
 (defn relation-table []
-  (let [relations (-> (query-relations)
-                      merge-relations)
-        message   "~s is very likely to be related with ~s due to terms we found on ~s --- ~s"]
-    [:ul (for [{:keys [source target relations]} relations]
-           [:li (cljs.pprint/cl-format nil message source target target relations)])]))
+  (let [rs      (-> (query-relations) merge-relations)]
+    [:ul (for [{:keys [source target relations]} rs]
+           ^{:key (str source target)}
+           [:div.box
+            [:li
+             [:p [:strong source]
+              " is very likely to be related with "
+              [:strong target] " due to terms we found on " [:strong target]
+              " ---- "
+              (str (into [] relations))]]])]))
 
-(defn status-bar [status]
-  (cond
-    (:searching @status)
-    [:p "Searching, please wait....."]
+(defn searching-bar [status]
+  (when (:searching @status)
+    [:div.container
+     [:p.notification.is-primary "Searching, please wait....."]
+     [:progress.progress.is-large.is-info]]))
 
-    (:error @status)
-    [:p "Opps, something went wrong, please retry!"]
+(defn error-bar [status]
+  (when (:error @status)
+    [:p.notification.is-danger "Opps, no results found, please retry!"]))
 
-    :else
+(defn tables [status]
+  (when-not (:searching @status)
     [:div
-     [:p "search list.."]
+     [:p.title.is-3 "search list.."]
      [result-table]
+     [:p.title.is-3 "possible relations..search more to explore!"]
      [relation-table]]))
 
-(defn search-button [val response]
-  [:input {:type "button" :value "Search!"
-           :on-click #(search val response)}])
+(defn search-button [status]
+  [:div.control
+   [:input.button.is-info
+    {:type     "button" :value "Search!"
+     :on-click #(search status)}]])
+
+(defn input-bar [status]
+  [:div.field.has-addons.has-addons-centered
+   [dropdown status]
+   [search-button status]])
+
+(defn main-body [status]
+  [:div
+   [searching-bar status]
+   [error-bar status]
+   [tables status]])
 
 (defn shared-state []
-  (let [search-val (r/atom "")
-        status     (r/atom {})]
+  (let [status     (r/atom {:search-val "" :searching false})]
 
-    ;; init with some sample searches
-    (search "java" status)
-    (search "clojure" status)
-    (search "lisp" status)
+    ;; init [db] with some sample searches
+    (go
+      (swap! status assoc :searching true)
+      (<! (search (r/atom {:search-val "java"})))
+      (<! (search (r/atom {:search-val "clojure"})))
+      (<! (search (r/atom {:search-val "lisp"})))
+      (<! (search (r/atom {:search-val "programming language"})))
+      (swap! status assoc :searching false))
 
     (fn []
       [:div
-       [:p [atom-input search-val status] [search-button @search-val status]]
-       [status-bar status]])))
+       [input-bar status]
+       [main-body status]])))
+
+
+;;;;;;;;;;;;;;;;;
+;; entry-point ;;
+;;;;;;;;;;;;;;;;;
 
 (defn ^:export run
   []
-  (js/console.log "Run starttt")
+  (js/console.log "Run start")
   (rd/render [shared-state] (js/document.getElementById "app")))
+
+
+
+
+
+
 
 (comment
   ;; TODO put this in a proper test ns some day..
 
   ;; init
   (def conn (d/create-conn schema))
-  (def status (r/atom {}))
 
-  ;; search two terms
-  (search "java" status)
-  (search "clojure" status)
-  (search "lisp" status)
+  ;; search three terms
+  (go
+    (<! (search (r/atom {:search-val "java"})))
+    (<! (search (r/atom {:search-val "clojure"})))
+    (<! (search (r/atom {:search-val "lisp"}))))
+
+  ;; check db
+  conn
 
   ;; query relations of java and clojure
   (query-relations)
@@ -164,4 +248,18 @@
   ;; merge into a map by source target title
   (merge-relations (query-relations))
 ;; => ({:source "java", :target "clojure", :relations ("Java (programming language)" "Java applet" "Java virtual machine")} {:source "lisp", :target "clojure", :relations ("Common Lisp" "Emacs Lisp" "Lisp (programming language)" "*Lisp" "Allegro Common Lisp")})
+
+  ;; search a new term
+  (go
+    (<! (search (r/atom {:search-val "Java applet"}))))
+
+  ;; search hint shall give all java hints except "Java applet"
+  (search-hint "java")
+;; => #{["Talk:Java applet"] ["Java (programming language)"] ["Java virtual machine"] ["2019 Java blackout"]}
+
+  ;; search with empty response alter state to error code
+  (def s (r/atom {:search-val "weihua"}))
+  (go (<! (search s)))
+  (:error @s)
+;; => :error/empty-response
   )
