@@ -7,4 +7,7 @@
                    :modules    {:main {:init-fn app.client/run
                                        :entries [app.client]}}
                    :devtools   {:after-load app.client/run
-                                :preloads   [devtools.preload]}}}}
+                                :preloads   [devtools.preload]}
+                   ;; default release compiler option doesn't work, has to use simple for now, not sure why..
+                   ;; Cannot read property 'toLowerCase' of undefined
+                   :release    {:compiler-options {:optimizations :simple}}}}}
